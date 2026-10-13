@@ -141,7 +141,7 @@ static void urc_socket_down_func(struct at_client *client, const char *data, rt_
     int conid, len;
 
     /* 跳过 "+EVENT:SocketDown" 到第一个逗号 */
-    p = rt_strchr(data, ',');
+    p = strchr(data, ',');
     if (p == RT_NULL)
     {
         return;
@@ -149,7 +149,7 @@ static void urc_socket_down_func(struct at_client *client, const char *data, rt_
     p++;
     conid = atoi(p);
 
-    p = rt_strchr(p, ',');
+    p = strchr(p, ',');
     if (p == RT_NULL)
     {
         return;
@@ -165,7 +165,7 @@ static void urc_socket_down_func(struct at_client *client, const char *data, rt_
     }
 
     /* 数据段：主动模式才有第二个逗号 */
-    p = rt_strchr(p, ',');
+    p = strchr(p, ',');
     if (p == RT_NULL || len <= 0)
     {
         LOG_W("SocketDown conid=%d len=%d without payload -- AT+SOCKETRECVCFG=1 not effective?",
@@ -199,7 +199,7 @@ static void urc_socket_close_func(struct at_client *client, const char *data, rt
 
     RT_UNUSED(size);
 
-    p = rt_strchr(data, ',');
+    p = strchr(data, ',');
     if (p == RT_NULL)
     {
         return;

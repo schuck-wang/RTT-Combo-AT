@@ -908,7 +908,7 @@ static void urc_ble_data_func(struct at_client *client, const char *data, rt_siz
     p += 6;
 
     len = atoi(p);
-    p = rt_strchr(p, ',');
+    p = strchr(p, ',');
     if (p == RT_NULL || len <= 0)
     {
         return;
@@ -2085,7 +2085,9 @@ MSH_CMD_EXPORT_ALIAS(combo_at_msh, combo_at, combo module: send raw AT command);
  * 照 at_sample_a9g.c 的用法：静态实例 + 开机自动注册
  * 不需要自动注册就定义 COMBO_AT_DEV_AUTO_REGISTER_DISABLE
  * ========================================================================== */
-#ifndef COMBO_AT_DEV_AUTO_REGISTER_DISABLE
+#if 0 /* 静态实例 + 自动注册已挪到 examples/at_sample_combo.c（按 at_device 包的惯例：
+       * 驱动只注册 device class，设备实例由 sample 注册），避免同一个 uart 上注册两次。
+       * 不想用示例、要在这里注册的话，把下面这行改回 #ifndef COMBO_AT_DEV_AUTO_REGISTER_DISABLE */
 static struct at_device_combo combo0 =
 {
     .device_name      = COMBO_SAMPLE_DEVICE_NAME,
