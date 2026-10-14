@@ -52,6 +52,9 @@
 
 #include <at.h>
 
+/* 只需要给下面的 combo_sock_test 用，但放头部更符合习惯 */
+#include <sys/socket.h>
+
 /* 未实现 server/监听模式：手册里 TCPServer/UDPServer 还需要处理
  * +EVENT:SocketSeed 产生的新 ConID，本文件没有做。开着会让 at_listen 空指针。 */
 #ifdef AT_USING_SOCKET_SERVER
@@ -68,6 +71,12 @@
 #define COMBO_SOCKET_SEND_MAX_SIZE     (1024)
 
 #define COMBO_SOCKET_RESP_TIMEOUT      (10 * RT_TICK_PER_SECOND)
+
+/* 二进制补齐：往 URC 里捞数据时用的暂存块（只在 AT 客户端接收线程里用，无并发） */
+#define COMBO_SOCKET_BIN_CHUNK         (256)
+#define COMBO_SOCKET_BIN_TIMEOUT       200
+
+static char combo_socket_bin_chunk[COMBO_SOCKET_BIN_CHUNK];
 
 /* ConID = 框架槽位 + 1 */
 #define COMBO_SOCKET_CONID(sock)       ((int)((sock)->user_data) + 1)
@@ -175,19 +184,67 @@ static void urc_socket_down_func(struct at_client *client, const char *data, rt_
     p++;
 
     {
+        /* ---- 二进制安全接收 ----
+         * at_recv_readline() 一遇到 \r\n 就结束本行（见 at_client.c），所以：
+         *
+         *   数据里没有 0x0D0A（绝大多数情况，概率 ~1 - 1/65536 per byte）
+         *     -> 整行 = 前缀 + 全部数据 + 模块行尾 \r\n，avail == len + 2
+         *        直接投递 len 字节，行尾 \r\n 已被行解析器吃掉，不用管
+         *
+         *   数据里含 0x0D0A（行在数据中间被截断）
+         *     -> avail <= len，剩下的还在串口里，用 at_client_obj_recv() 裸读补齐
+         *
+         * at_client_obj_recv() 的官方注释就是"只能用在 URC 回调里"：它直接
+         * rt_device_read 串口，绕过行解析；用完把 RX 超时恢复成 RT_WAITING_NO
+         * （at_client_init() 里的初始值），所以对接收线程没有副作用。
+         * 注意：URC 回调里绝对不能改成 at_obj_exec_cmd()，那个会死等。 */
         rt_size_t off   = (rt_size_t)(p - data);
         rt_size_t avail = (size > off) ? (size - off) : 0;
+        rt_size_t got   = ((rt_size_t)len < avail) ? (rt_size_t)len : avail;
 
-        if ((rt_size_t)len > avail)
+        if (got > 0 && at_evt_cb_set[AT_SOCKET_EVT_RECV] != RT_NULL)
         {
-            LOG_W("SocketDown conid=%d len=%d but only %d bytes in URC line.", conid, len, (int)avail);
-            len = (int)avail;
+            at_evt_cb_set[AT_SOCKET_EVT_RECV](sock, AT_SOCKET_EVT_RECV, p, got);
         }
-    }
 
-    if (len > 0 && at_evt_cb_set[AT_SOCKET_EVT_RECV] != RT_NULL)
-    {
-        at_evt_cb_set[AT_SOCKET_EVT_RECV](sock, AT_SOCKET_EVT_RECV, p, (size_t)len);
+        /* 被截断了就裸读补齐（分块投递，不需要大缓冲） */
+        while (got < (rt_size_t)len)
+        {
+            rt_size_t  want = (rt_size_t)len - got;
+            rt_ssize_t n;
+
+            if (want > sizeof(combo_socket_bin_chunk))
+            {
+                want = sizeof(combo_socket_bin_chunk);
+            }
+
+            n = (rt_ssize_t)at_client_obj_recv(client, combo_socket_bin_chunk, want,
+                                               COMBO_SOCKET_BIN_TIMEOUT);
+            if (n <= 0)
+            {
+                LOG_W("SocketDown conid=%d: short read %d/%d bytes (peer reset?).",
+                      conid, (int)got, len);
+                break;
+            }
+            if ((rt_size_t)n > want)
+            {
+                n = (rt_ssize_t)want;       /* 防御上游 rt_device_read 异常返回值 */
+            }
+
+            if (at_evt_cb_set[AT_SOCKET_EVT_RECV] != RT_NULL)
+            {
+                at_evt_cb_set[AT_SOCKET_EVT_RECV](sock, AT_SOCKET_EVT_RECV,
+                                                  combo_socket_bin_chunk, (size_t)n);
+            }
+            got += (rt_size_t)n;
+        }
+
+        /* 只有"提前断行"的情况才需要把模块行尾的 \r\n 吃掉：
+         * avail > len 时它已经作为行结束符被行解析器吃掉了 */
+        if (avail <= (rt_size_t)len)
+        {
+            at_client_obj_recv(client, combo_socket_bin_chunk, 2, COMBO_SOCKET_BIN_TIMEOUT);
+        }
     }
 }
 
@@ -466,5 +523,209 @@ int combo_socket_class_register(struct at_device_class *class)
 
     return RT_EOK;
 }
+
+/* ==========================================================================
+ * MSH：二进制链路验证
+ * --------------------------------------------------------------------------
+ * socket 数据是"搭在 +EVENT:SocketDown 这一行里"传的，而 at_client 的行解析器
+ * 一遇到 \r\n 就断行 —— 所以 urc_socket_down_func() 必须用 at_client_obj_recv()
+ * 裸读补齐。那套逻辑只有真实模组才能验证，这个命令就是干这个的：
+ * 从 HTTP 服务器拉一个文件，算【实收字节数 + CRC32】，和服务器端对比。
+ *
+ * 为什么选 HTTP 而不是裸 TCP：HTTP 响应头**本身就是 CRLF 拼的**，
+ * 所以它一次性把"含大量 CRLF 的文本"和"纯二进制 body"两条路都验证了。
+ * ========================================================================== */
+#ifdef FINSH_USING_MSH
+
+#define COMBO_TEST_BUF_SIZE       (1024)
+#define COMBO_TEST_MAX_ERR        (5)
+
+/* 标准 CRC32（IEEE 802.3, poly 0xEDB88320, 初值 0xFFFFFFFF, 末尾取反）
+ * PC 端对照（Python 的 zlib.crc32 就是同一条）：
+ *   python -c "import zlib,sys;print('%08X'%zlib.crc32(open(sys.argv[1],'rb').read()))" fw.bin */
+static rt_uint32_t combo_test_crc32(rt_uint32_t crc, const rt_uint8_t *buf, rt_size_t len)
+{
+    rt_size_t i;
+    int       j;
+
+    for (i = 0; i < len; i++)
+    {
+        crc ^= buf[i];
+        for (j = 0; j < 8; j++)
+        {
+            crc = (crc >> 1) ^ (0xEDB88320u & (rt_uint32_t)(-(rt_int32_t)(crc & 1u)));
+        }
+    }
+
+    return crc;
+}
+
+static void combo_sock_test(int argc, char **argv)
+{
+    struct sockaddr_in addr;
+    char        ip[16]   = {0};
+    char        req[256] = {0};
+    char        hdr[512] = {0};
+    char        buf[COMBO_TEST_BUF_SIZE];
+    rt_uint32_t crc       = 0xFFFFFFFFu;
+    rt_size_t   hdr_len   = 0;
+    rt_size_t   body_len  = 0;
+    rt_uint32_t hdr_state = 0;
+    rt_bool_t   in_hdr    = RT_TRUE;
+    int err_cnt = 0, fd, n, port, i;
+
+    if (argc < 4)
+    {
+        rt_kprintf("usage: combo_sock_test <host> <port> <path>\n"
+                   "   eg: combo_sock_test 192.168.1.10 80 /fw.bin\n"
+                   "HTTP GET -> skip header -> print body bytes + CRC32 (no flash write).\n"
+                   "PC check: python -c \"import zlib,sys;print('%%08X'%%zlib.crc32(open(sys.argv[1],'rb').read()))\" fw.bin\n");
+        return;
+    }
+    if (combo_at_get_client() == RT_NULL)
+    {
+        rt_kprintf("combo: AT client not ready\n");
+        return;
+    }
+
+    port = atoi(argv[2]);
+    if (combo_domain_resolve(argv[1], ip) != RT_EOK)
+    {
+        rt_kprintf("dns \"%s\" failed\n", argv[1]);
+        return;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        rt_kprintf("socket() failed: %d\n", fd);
+        return;
+    }
+
+    rt_memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    /* 自己换字节序，免得依赖 htons 的可用性 */
+    addr.sin_port        = (rt_uint16_t)(((port & 0xFF) << 8) | ((port >> 8) & 0xFF));
+    addr.sin_addr.s_addr = inet_addr(ip);
+
+    rt_kprintf("GET http://%s:%d%s ...\n", ip, port, argv[3]);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        rt_kprintf("connect() failed\n");
+        closesocket(fd);
+        return;
+    }
+
+    rt_snprintf(req, sizeof(req),
+                "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+                argv[3], argv[1]);
+    if (send(fd, req, rt_strlen(req), 0) < 0)
+    {
+        rt_kprintf("send() failed\n");
+        closesocket(fd);
+        return;
+    }
+
+    for (;;)
+    {
+        n = recv(fd, buf, sizeof(buf), 0);
+        if (n == 0)
+        {
+            break;                      /* 对端关闭，正常结束 */
+        }
+        if (n < 0)
+        {
+            if (++err_cnt > COMBO_TEST_MAX_ERR)
+            {
+                rt_kprintf("recv() error/timeout, give up\n");
+                break;
+            }
+            continue;                   /* 偶发超时，再试 */
+        }
+        err_cnt = 0;
+
+        i = 0;
+
+        if (in_hdr)
+        {
+            /* 逐字节找响应头结束 \r\n\r\n（状态机可以跨 recv 边界） */
+            for (; i < n; i++)
+            {
+                char c = (char)buf[i];
+
+                if (hdr_len < sizeof(hdr) - 1)
+                {
+                    hdr[hdr_len++] = c;
+                }
+
+                if (c == '\r')
+                {
+                    hdr_state = (hdr_state == 0 || hdr_state == 2) ? hdr_state + 1 : 1;
+                }
+                else if (c == '\n')
+                {
+                    hdr_state = (hdr_state == 1 || hdr_state == 3) ? hdr_state + 1 : 0;
+                }
+                else
+                {
+                    hdr_state = 0;
+                }
+
+                if (hdr_state == 4)
+                {
+                    i++;                /* 跳过这个 \n */
+                    in_hdr = RT_FALSE;
+                    break;
+                }
+            }
+
+            if (in_hdr)
+            {
+                continue;               /* 这一块整块都是响应头 */
+            }
+        }
+
+        if (i < n)
+        {
+            rt_size_t old = body_len;
+
+            crc = combo_test_crc32(crc, (const rt_uint8_t *)buf + i, (rt_size_t)(n - i));
+            body_len += (rt_size_t)(n - i);
+
+            if (body_len / (64 * 1024) != old / (64 * 1024))
+            {
+                rt_kprintf("  ... %d bytes\n", (int)body_len);
+            }
+        }
+    }
+
+    closesocket(fd);
+
+    hdr[hdr_len] = '\0';
+
+    rt_kprintf("--- response header ---\n%s------------------------\n", hdr);
+
+    {
+        char *cl = rt_strstr(hdr, "Content-Length:");
+
+        if (cl == RT_NULL)
+        {
+            cl = rt_strstr(hdr, "content-length:");
+        }
+        if (cl != RT_NULL)
+        {
+            int want = atoi(cl + 15);
+
+            rt_kprintf("Content-Length = %d, received = %d -> %s\n",
+                       want, (int)body_len,
+                       (want == (int)body_len) ? "MATCH" : "*** MISMATCH ***");
+        }
+    }
+
+    rt_kprintf("body: %d bytes, CRC32 = %08X\n", (int)body_len, (unsigned)(~crc));
+}
+MSH_CMD_EXPORT_ALIAS(combo_sock_test, combo_sock_test, combo: HTTP body byte count + CRC32 (verify binary path));
+
+#endif /* FINSH_USING_MSH */
 
 #endif /* AT_DEVICE_USING_COMBO && AT_USING_SOCKET */

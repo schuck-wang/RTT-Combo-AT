@@ -13,6 +13,22 @@
 
 #include <rtthread.h>
 
+/* ==========================================================================
+ * 0. 板级硬件引脚
+ * --------------------------------------------------------------------------
+ * 使能脚 / 状态脚 / 唤醒脚**不在 Kconfig 里配** —— 那边只能填 GPIO 的裸数字
+ * 序号，填错了也看不出来。改成在这里用 GET_PIN(端口, 序号) 直接写，
+ * 必须在 #include "combo_at_dev.h" **之前**定义（头文件里是 #ifndef 包着的）。
+ *
+ *   例：使能脚接 PC6、唤醒脚接 PA1
+ *       #define COMBO_SAMPLE_POWER_PIN    GET_PIN(C, 6)
+ *       #define COMBO_SAMPLE_WAKEUP_PIN   GET_PIN(A, 1)
+ *
+ * 没接的就保持注释状态，头文件默认是 (-1) = 不控制。
+ * 也可以在别的初始化代码里直接赋值：combo0.power_pin = GET_PIN(C, 6);
+ * ========================================================================== */
+#include <drv_gpio.h>          /* GET_PIN()：STM32 BSP 的 drivers/drv_gpio.h */
+
 #include "combo_at_dev.h"
 
 #ifdef AT_DEVICE_USING_COMBO
@@ -29,8 +45,12 @@
  * --------------------------------------------------------------------------
  * 与 at_device 包的 samples/at_sample_esp8266.c 一个路子：
  *     静态实例 -> INIT_APP_EXPORT(注册)
- * 名字/串口/SSID 全取自 combo_at_dev.h 的 COMBO_SAMPLE_xxx 宏；要改就在
- * rtconfig.h 里覆盖同名宏（头文件里那些宏都是 #ifndef 包着的）。
+ * 名字/串口/SSID 全取自 combo_at_dev.h 的 COMBO_SAMPLE_xxx 宏（头文件里都是
+ * #ifndef 包着的）；引脚类宏在上面第 0 节用 GET_PIN 定义，其余在 rtconfig.h 覆盖。
+ *
+ * 注意：wifi_ssid / wifi_password 只有在 COMBO_INIT_WIFI_AUTO=1 时才会被用上。
+ * 默认（=0）初始化不碰 WiFi/BLE，改用 combo_wifi_start() / combo_ble_start()
+ * 按需启动（下面的 MSH 命令 at_combo_sample join / ble 就是演示这两种用法）。
  * ========================================================================== */
 static struct at_device_combo combo0 =
 {
@@ -38,6 +58,7 @@ static struct at_device_combo combo0 =
     .client_name      = COMBO_SAMPLE_CLIENT_NAME,
     .power_pin        = COMBO_SAMPLE_POWER_PIN,
     .power_status_pin = COMBO_SAMPLE_STATUS_PIN,
+    .wakeup_pin       = COMBO_SAMPLE_WAKEUP_PIN,
     .recv_line_num    = COMBO_SAMPLE_RECV_BUFF_LEN,
     .wifi_ssid        = COMBO_SAMPLE_WIFI_SSID,
     .wifi_password    = COMBO_SAMPLE_WIFI_PASSWORD,
@@ -183,8 +204,17 @@ static void at_combo_sample(int argc, char **argv)
             rt_kprintf("usage: at_combo_sample join <ssid> [password]\n");
             return;
         }
-        rt_kprintf("AT+WJAP: %s (wait for +EVENT:WIFI_GOT_IP)\n",
-                   (combo_wifi_join(argv[2], (argc >= 4) ? argv[3] : "") == RT_EOK) ? "OK" : "FAIL");
+        rt_kprintf("AT+WMODE/WJAP: %s (wait for +EVENT:WIFI_GOT_IP, then `ifconfig`)\n",
+                   (combo_wifi_start(argv[2], (argc >= 4) ? argv[3] : "") == RT_EOK) ? "OK" : "FAIL");
+    }
+    else if (rt_strcmp(argv[1], "ble") == 0)
+    {
+        /* 一步启动 BLE：关自动透传 + 设名字 + 设模式（都不写 flash） */
+        const char *name = (argc >= 3) ? argv[2] : COMBO_SAMPLE_BLE_NAME;
+        int         mode = (argc >= 4) ? atoi(argv[3]) : COMBO_BLE_MODE;
+
+        rt_kprintf("ble start(name=\"%s\", mode=%d): %s\n", name, mode,
+                   (combo_ble_start(name, mode) == RT_EOK) ? "OK" : "FAIL");
     }
     else if (rt_strcmp(argv[1], "auto") == 0 && argc >= 3)
     {
@@ -221,6 +251,7 @@ static void at_combo_sample(int argc, char **argv)
         rt_kprintf("usage: at_combo_sample [dump]\n"
                    "       at_combo_sample join <ssid> [pwd]\n"
                    "       at_combo_sample auto <0|1> [ssid] [pwd]\n"
+                   "       at_combo_sample ble [name] [mode]\n"
                    "       at_combo_sample ping <host>\n"
                    "       at_combo_sample disconn\n"
                    "       at_combo_sample adv [0|1]\n"

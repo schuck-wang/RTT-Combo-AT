@@ -95,17 +95,116 @@ extern "C" {
 #define COMBO_SAMPLE_CLIENT_NAME          "uart2"
 #endif
 
-/** AT 接收行缓冲大小。要能放下 URC 整行 + 一包 socket 数据，别小于 512 */
+/**
+ * AT 行缓冲大小（接收、发送各一份）。
+ * socket 收数据时**整包都要塞进这一行**，所以下固件包这种大数据必须放大：
+ *   至少要 ≥ 模组单包最大长度 + 前缀长度 + 2。
+ * 默认 4096 能覆盖常见 TCP 段（1460）两倍多。
+ * ⚠️ 太小会触发 at_client 的 "read line failed ... out of buffer size" 并**丢包**
+ *    （而且是静默丢整包，后续字节还会被当成新行解析 → 数据流错位）。
+ */
 #ifndef COMBO_SAMPLE_RECV_BUFF_LEN
-#define COMBO_SAMPLE_RECV_BUFF_LEN        (1024)
+#define COMBO_SAMPLE_RECV_BUFF_LEN        (4096)
 #endif
 
-/** 模组复位/使能脚：-1 表示不控制 */
+/**
+ * 模组使能脚（手册 1.3：芯片使能管脚，**高电平有效**）。
+ * -1（默认）= 不控制，由硬件常置有效；>=0 = 由驱动拉高/拉低。
+ *
+ * 引脚**不在 Kconfig 里配**（那边只能填裸数字序号，容易填错），
+ * 在代码里用 GET_PIN(端口, 序号) 定义即可，且要在 #include "combo_at_dev.h" 之前：
+ *     #define COMBO_SAMPLE_POWER_PIN    GET_PIN(C, 6)
+ */
 #ifndef COMBO_SAMPLE_POWER_PIN
 #define COMBO_SAMPLE_POWER_PIN            (-1)
 #endif
+
+/** 使能脚有效电平。本板高电平有效 -> PIN_HIGH；低有效改 PIN_LOW */
+#ifndef COMBO_POWER_ON_LEVEL
+#define COMBO_POWER_ON_LEVEL              (PIN_HIGH)
+#endif
+
+/** 拉高使能脚后，留出模组启动到打出 "ready" 的时间 */
+#ifndef COMBO_POWER_ON_DELAY_MS
+#define COMBO_POWER_ON_DELAY_MS           (1000)
+#endif
+/** 拉低使能脚后，等电源真正掉下去的时间 */
+#ifndef COMBO_POWER_OFF_DELAY_MS
+#define COMBO_POWER_OFF_DELAY_MS          (300)
+#endif
+/** 1 = 每次初始化先断电再上电（硬复位，状态最干净）；0 = 直接拉高 */
+#ifndef COMBO_POWER_CYCLE
+#define COMBO_POWER_CYCLE                 (1)
+#endif
+/** 等 "ready" 失败后断电重来的次数。只有配了使能脚(POWER_PIN>=0)才会重试 */
+#ifndef COMBO_INIT_RETRY_NUM
+#define COMBO_INIT_RETRY_NUM              (2)
+#endif
+
+/**
+ * 模组电源状态指示脚：**可选**，没接就保持 -1。
+ * 它和使能脚是**各自独立**判断的 —— 只接使能脚、不接状态脚是完全正常的用法。
+ * 同样用 GET_PIN 在代码里定义： #define COMBO_SAMPLE_STATUS_PIN  GET_PIN(D, 3)
+ */
 #ifndef COMBO_SAMPLE_STATUS_PIN
 #define COMBO_SAMPLE_STATUS_PIN           (-1)
+#endif
+
+/* ---- 手册 2.10 AT+SLEEP=<mode>[,<wakeup source>,<param1>,<param2>] ----
+ * mode        0/1 浅睡眠(上电不自动/自动)  2 深度睡眠  3 普通模式
+ * wake source 0 定时器唤醒  2 GPIO 唤醒
+ * param1      source=0 时的定时 ms / source=2 时的 GPIO 序号
+ * param2      source=2 时：0 低电平 1 高电平 2 下降沿 3 上升沿 4 双边沿
+ *
+ * Ai-WB2 注意事项（手册 2.10 注释）：
+ *   1. 只支持 mode 2/3，默认 3（普通模式）—— 浅睡眠 0/1 是 PB/TB 系列才有
+ *   2. GPIO 唤醒**只能用 IO7**，而 IO7 就是模组的 RX，所以官方推荐
+ *      AT+SLEEP=2,2,7,0（深度睡眠 + IO7 低电平唤醒）
+ *      "低电平唤醒"和"串口发任意数据唤醒"其实是同一件事：
+ *      串口数据的起始位就会把 RX 拉低
+ *   3. 深度睡眠被唤醒后模组会重启，重新打印一遍启动信息
+ */
+#ifndef COMBO_SLEEP_MODE
+#define COMBO_SLEEP_MODE                  (2)     /* 深度睡眠 */
+#endif
+#ifndef COMBO_SLEEP_WAKE_SOURCE
+#define COMBO_SLEEP_WAKE_SOURCE           (2)     /* GPIO 唤醒 */
+#endif
+#ifndef COMBO_SLEEP_WAKE_PIN
+#define COMBO_SLEEP_WAKE_PIN              (7)     /* Ai-WB2 只有 IO7(=RX) */
+#endif
+#ifndef COMBO_SLEEP_WAKE_LEVEL
+#define COMBO_SLEEP_WAKE_LEVEL            (0)     /* 0 = 低电平唤醒 */
+#endif
+/** AT+SLEEP 回 OK 只表示"已受理"，再给模组一点时间真正睡下去 */
+#ifndef COMBO_SLEEP_ENTER_DELAY_MS
+#define COMBO_SLEEP_ENTER_DELAY_MS        (100)
+#endif
+/** 发完唤醒信号后，等模组反应的时间 */
+#ifndef COMBO_WAKEUP_DELAY_MS
+#define COMBO_WAKEUP_DELAY_MS             (200)
+#endif
+
+/* ---- 唤醒脚（可选）：combo_wakeup() 优先用它，没配才退回"串口发数据" ----
+ * 别把两侧的"脚号"搞混：
+ *   COMBO_SLEEP_WAKE_PIN  = **模组侧**的 IO 序号，Ai-WB2 固定是 7
+ *   COMBO_SAMPLE_WAKEUP_PIN = **MCU 侧**那根去拉唤醒网络的 GPIO 编号（-1 = 没接）
+ * 两者可以指向同一根网络（板上把 MCU 某个 GPIO 接到模组的 IO7/RX），
+ * 也可以就是同一根 UART 线（那样只能用串口方式，把本项留 -1）。
+ *
+ * 同样不在 Kconfig 里配，用 GET_PIN(端口, 序号) 在代码里定义：
+ *     #define COMBO_SAMPLE_WAKEUP_PIN   GET_PIN(A, 1)
+ */
+#ifndef COMBO_SAMPLE_WAKEUP_PIN
+#define COMBO_SAMPLE_WAKEUP_PIN           (-1)
+#endif
+/** 唤醒脚的"有效"电平。Ai-WB2 是低电平唤醒 -> PIN_LOW */
+#ifndef COMBO_WAKEUP_PIN_LEVEL
+#define COMBO_WAKEUP_PIN_LEVEL            (PIN_LOW)
+#endif
+/** 唤醒脚保持有效电平的时间，之后恢复到无效电平（不要一直拉着） */
+#ifndef COMBO_WAKEUP_PIN_PULSE_MS
+#define COMBO_WAKEUP_PIN_PULSE_MS         (50)
 #endif
 
 /** 上电自动连接 AP 的账号（空串表示不自动连，只初始化模组） */
@@ -120,6 +219,40 @@ extern "C" {
 #ifndef COMBO_SAMPLE_BLE_NAME
 #define COMBO_SAMPLE_BLE_NAME             "ai-thinker"
 #endif
+/** BLE 默认工作模式：0 从机  1 主机  2 iBeacon  9 关闭 */
+#ifndef COMBO_BLE_MODE
+#define COMBO_BLE_MODE                    (0)
+#endif
+
+/* ---- 初始化阶段要不要顺带把 WiFi / BLE 配起来 ----
+ * 默认都是 0 = **完全不碰**。init 只做设备本身的最小初始化：
+ *     上电 -> 等 ready -> ATE0 -> 确认 URC 掩码
+ * WiFi / BLE 的配置与连接由使用方按需调 combo_wifi_start() / combo_ble_start()。
+ * 这样"只用蓝牙"、"只用 WiFi"、"两者共存"三种用法互不干扰
+ * （只用蓝牙时不会去动 WiFi 模式，反之亦然）。
+ *
+ * 设成 1 则恢复"初始化时自动配"的老行为：
+ *   COMBO_INIT_WIFI_AUTO=1 -> 只要有 wifi_ssid 就 AT+WMODE + 连 AP + 等 IP
+ *   COMBO_INIT_BLE_SETUP=1 -> 设 BLE 名字 + 关掉"连接后自动进透传"
+ */
+#ifndef COMBO_INIT_WIFI_AUTO
+#define COMBO_INIT_WIFI_AUTO              (0)
+#endif
+#ifndef COMBO_INIT_BLE_SETUP
+#define COMBO_INIT_BLE_SETUP              (0)
+#endif
+
+/* ---- 改 WiFi/BLE 参数要不要写进模组 flash ----
+ * 这两条 AT 指令都有 saveFlash 参数。默认 0 = 只本次生效、不写 flash，
+ * 否则每次上电（含断电重试）都会重写一遍 flash。
+ * 要持久化就自己显式调一次 combo_wifi_set_mode(1, 1)。
+ */
+#ifndef COMBO_WIFI_MODE_SAVE
+#define COMBO_WIFI_MODE_SAVE              (0)
+#endif
+#ifndef COMBO_BLE_CFG_SAVE
+#define COMBO_BLE_CFG_SAVE                (0)
+#endif
 
 /* ==========================================================================
  * 2. 设备实例（字段布局与 at_device_a9g / at_device_esp8266 保持一致）
@@ -128,8 +261,9 @@ struct at_device_combo
 {
     char  *device_name;        /* netdev / at_device 名字            */
     char  *client_name;        /* AT 客户端名（就是串口设备名）      */
-    int    power_pin;          /* 使能/复位脚，-1 不用                */
-    int    power_status_pin;
+    int    power_pin;          /* 使能脚，-1 不用                    */
+    int    power_status_pin;   /* 电源状态指示脚，-1 不用            */
+    int    wakeup_pin;         /* 唤醒脚(MCU 侧 GPIO)，-1 = 没有，退回串口方式 */
     size_t recv_line_num;      /* AT 行缓冲大小                      */
 
     char  *wifi_ssid;          /* 上电要连的 AP，NULL/空串则跳过     */
@@ -177,8 +311,60 @@ int combo_at_dev_register(struct at_device_combo *combo);
 int combo_at_device_class_register(void);
 
 /* ==========================================================================
+ * 4.1 电源 / 低功耗（手册 1.3 使能脚 + 2.10 AT+SLEEP）
+ * --------------------------------------------------------------------------
+ * 这几个都需要 COMBO_SAMPLE_POWER_PIN >= 0（使能脚真的接到 MCU 上）；
+ * 没配使能脚时 power on/off 返回 -RT_ENOSYS，sleep/wakeup 仍然可用。
+ * ========================================================================== */
+
+/**
+ * @brief 完整重新上电：断电(可选) -> 拉高使能脚 -> 等 "ready"
+ *        -> ATE0 -> 确认 URC 掩码 -> 按 wifi_ssid 重连 AP -> BLE 设置
+ * @return RT_EOK 成功；-RT_ENOSYS 没配使能脚；-RT_ETIMEOUT 模组没应答
+ * @note   打开 AT_DEVICE_COMBO_INIT_ASYN 时这里是异步的，返回只代表线程已启动
+ */
+int combo_power_on(void);
+
+/**
+ * @brief 断电：拉低使能脚 + netdev link down + is_init = RT_FALSE
+ * @return RT_EOK 成功；-RT_ENOSYS 没配使能脚
+ */
+int combo_power_off(void);
+
+/**
+ * @brief 手册 2.10 AT+SLEEP=<mode>[,<wakeup source>,<param1>,<param2>]
+ * @param mode        0/1 浅睡眠  2 深度睡眠  3 普通模式（Ai-WB2 只有 2/3）
+ * @param wake_source 0 定时器唤醒  2 GPIO 唤醒
+ * @param param1      source=0 定时 ms / source=2 GPIO 序号
+ * @param param2      source=2 唤醒电平 0 低 1 高 2 下降 3 上升 4 双边
+ * @note  Ai-WB2 用 combo_sleep(2, 2, 7, 0)；深度睡眠被唤醒后模组会重启
+ */
+int combo_sleep(int mode, int wake_source, int param1, int param2);
+
+/**
+ * @brief 唤醒：先产生唤醒信号，再探测模组是否回来
+ *        唤醒信号优先用**专用唤醒脚**（COMBO_SAMPLE_WAKEUP_PIN >= 0）；
+ *        没配脚就退回"往串口发任意数据"（起始位把 IO7/RX 拉低）。
+ *        之后先按"浅睡眠未重启"探测 AT，不行再按"深度睡眠已重启"等 ready，
+ *        最后补 ATE0 + URC 掩码。
+ * @return RT_EOK 成功；-RT_ETIMEOUT 模组没应答
+ */
+int combo_wakeup(void);
+
+/* ==========================================================================
  * 5. WiFi API（都是一次性 AT 指令，不依赖 netdev，任何线程可调）
  * ========================================================================== */
+
+/**
+ * @brief 按需启动 WiFi STA 并连接 AP（**不写 flash**）= AT+WMODE=1,0 + AT+WJAP
+ * @note  连上并拿到 IP 后模组会发 +EVENT:WIFI_GOT_IP，驱动内部的"网络监视"
+ *        线程收到后会查 AT+STAINFO? 并把 netdev 拉起来（IP/网关/掩码/DNS/
+ *        link up），所以这里**不需要**自己轮询等 IP。
+ *        （URC 回调跑在 AT 客户端接收线程里，不能在里面发 AT 指令，
+ *          所以查询必须异步做 —— 这就是那个线程存在的原因。）
+ * @return RT_EOK 表示模组已受理 AT+WJAP；真正联网成功看 netdev 状态
+ */
+int combo_wifi_start(const char *ssid, const char *password);
 
 /** AT+WMODE=<MODE>,<save>: 0 关闭 1 STA 2 AP 3 AP+STA */
 int combo_wifi_set_mode(int mode, int save_flash);
@@ -222,6 +408,19 @@ int combo_domain_resolve(const char *name, char ip[16]);
  * ========================================================================== */
 
 /** AT+BLEMODE=<mode> / AT+BLEMODE?: 0 从机 1 主机 2 iBeacon 9 关闭 */
+/* ==========================================================================
+ * 6. BLE API（手册 5.x）
+ * ========================================================================== */
+
+/**
+ * @brief 按需启动 BLE：关掉"连接后自动进透传" + 设名字 + 设工作模式
+ * @param name 设备名，NULL/空串则不设
+ * @param mode 0 从机  1 主机  2 iBeacon  9 关闭；<0 表示不改模式
+ * @note  改名字要求蓝牙处于关闭状态，combo_ble_set_name() 内部会自动处理
+ * @return RT_EOK 全部成功；-RT_ERROR 至少有一项失败（日志里有具体哪项）
+ */
+int combo_ble_start(const char *name, int mode);
+
 int combo_ble_set_mode(int mode);
 int combo_ble_get_mode(int *mode);
 
@@ -242,6 +441,26 @@ int combo_ble_get_adv_enable(int *enabled);
 
 /** AT+BLEADVINTV=<intv>：单位 0.625ms，取值 160~16384 */
 int combo_ble_set_adv_interval(int intv);
+
+/**
+ * @brief 手册 5.2.3 AT+BLECONINTV=<min>,<max>,<latency>,<timeout>
+ *        **BLE 连接状态下省电的正道**（拉长连接间隔，从机可以少醒几次）
+ * @param min_interval 最小连接间隔 6~3200，实际 = ×1.25ms（要求 7.5ms~4s）
+ * @param max_interval 最大连接间隔 6~3200，实际 = ×1.25ms（要求 7.5ms~4s）
+ * @param latency      slave latency，从机可跳过几次连接事件，0~499
+ * @param timeout      监督超时 10~3200，实际 = ×10ms（100ms~32s），
+ *                     且必须满足：timeout×10 > (1+latency)×max_interval×1.25
+ * @note  仅允许在蓝牙关闭状态下设置 —— 函数内部自动关蓝牙、设完再还原
+ * @note  例：combo_ble_set_conn_interval(800, 800, 0, 600) → 1s 间隔 / 6s 超时
+ * @return RT_EOK；-RT_EINVAL 参数越界或不满足上面的规范约束；-RT_ERROR 指令失败
+ */
+int combo_ble_set_conn_interval(int min_interval, int max_interval, int latency, int timeout);
+
+/**
+ * @brief 查询 BLE 连接间隔（手册 5.2.3 响应 +BLECONINTV:<min>,<max>,<lat>,<timeout>）
+ * @param 四个输出参数都能传 NULL
+ */
+int combo_ble_get_conn_interval(int *min_interval, int *max_interval, int *latency, int *timeout);
 
 /** AT+BLEAUTH=<pind>：6 位数字，或 "DISENABLE" 关闭配对码 */
 int combo_ble_set_pin(const char *pin);

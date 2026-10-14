@@ -56,6 +56,9 @@
 #define COMBO_DEFAULT_MTU              (1500)
 #define COMBO_HWADDR_LEN               (6)
 
+/* 取"有效电平"的反相电平（PIN_HIGH <-> PIN_LOW） */
+#define COMBO_PIN_INACTIVE(level)      (((level) == PIN_HIGH) ? PIN_LOW : PIN_HIGH)
+
 /* 手册 1.5 的 URC 掩码位（AT+SYSMSG 的 mask） */
 #define COMBO_SYSMSG_BIT_SOCKET_DOWN   (1u << 4)
 #define COMBO_SYSMSG_BIT_SOCKET_DISC   (1u << 6)
@@ -84,6 +87,19 @@ static void  *combo_ble_scan_arg = RT_NULL;
 /* AT+BLESCAN 的输出是 name/MAC/rssi 三行一组，这里暂存前两行 */
 static char   combo_scan_name[32] = {0};
 static int    combo_scan_rssi = 0;
+
+/* ---- 网络事件（异步）----
+ * URC 回调是由 at_client.c 的 client_parser() 在 **AT 客户端接收线程**里
+ * 原地调用的，而 at_obj_exec_cmd() 要等一个只有该线程（走完响应解析后）才会
+ * rt_event_send 的通知 —— 在 URC 回调里发 AT 指令必然超时，还会把接收线程
+ * 堵住。所以 URC 只置事件，真正的 AT 查询交给下面这个线程做。 */
+#define COMBO_EVT_WIFI_GOT_IP         (1u << 0)
+#define COMBO_EVT_THREAD_STACK_SIZE   (1024)
+#define COMBO_EVT_THREAD_PRIORITY     (RT_THREAD_PRIORITY_MAX / 2)
+
+static struct rt_event  combo_evt;
+static rt_thread_t      combo_evt_tid   = RT_NULL;
+static rt_bool_t        combo_evt_ready = RT_FALSE;
 
 /* ==========================================================================
  * 内部工具
@@ -695,23 +711,100 @@ static struct netdev *combo_netdev_add(const char *netdev_name)
 }
 
 /* ==========================================================================
- * 初始化线程
+ * 电源 / 低功耗（手册 1.3 使能脚 + 2.10 AT+SLEEP）
  * ========================================================================== */
-static void combo_init_thread_entry(void *parameter)
-{
-    struct at_device *device = (struct at_device *)parameter;
-    struct at_device_combo *combo = (struct at_device_combo *)device->user_data;
-    struct combo_wifi_info info;
-    char at_ver[32] = {0};
-    int  i;
 
-    /* 等模组启动信息（手册 1.2，最后一行是 ready）。上电到 ready 要几秒 */
-    if (at_client_obj_wait_connect(device->client, COMBO_WAIT_CONNECT_TIME) != RT_EOK)
+/** 取组合设备对象 */
+static struct at_device_combo *combo_get_combo(void)
+{
+    if (combo_device == RT_NULL)
     {
-        LOG_E("wait \"ready\" timeout(%d ms), check uart wiring/baudrate(115200 8N1).",
-              COMBO_WAIT_CONNECT_TIME);
+        return RT_NULL;
+    }
+    return (struct at_device_combo *)combo_device->user_data;
+}
+
+/** 只操作使能脚电平：on=1 拉有效电平，on=0 拉无效电平。没配脚就是空操作 */
+static void combo_power_pin_write(int on)
+{
+    struct at_device_combo *combo = combo_get_combo();
+
+    if (combo == RT_NULL || combo->power_pin < 0)
+    {
         return;
     }
+
+    rt_pin_mode(combo->power_pin, PIN_MODE_OUTPUT);
+    rt_pin_write(combo->power_pin,
+                 on ? COMBO_POWER_ON_LEVEL : COMBO_PIN_INACTIVE(COMBO_POWER_ON_LEVEL));
+}
+
+/**
+ * 为"等 ready"做准备：先断电(可选)再上电，然后留出模组启动的时间。
+ * 没配使能脚时直接返回（上电由硬件负责），这样对现有工程零影响。
+ */
+static void combo_power_cycle(void)
+{
+    struct at_device_combo *combo = combo_get_combo();
+
+    if (combo == RT_NULL || combo->power_pin < 0)
+    {
+        return;
+    }
+
+#if COMBO_POWER_CYCLE
+    combo_power_pin_write(0);
+    rt_thread_mdelay(COMBO_POWER_OFF_DELAY_MS);
+#endif
+    combo_power_pin_write(1);
+    rt_thread_mdelay(COMBO_POWER_ON_DELAY_MS);
+}
+
+/**
+ * 上电 + 等 "ready"，失败就断电重来。
+ *
+ * !!! 顺序很关键 !!!
+ * 手册 1.3 的使能脚是"高电平有效"：模组没被使能时不会打印启动信息，
+ * 所以必须先上电再 at_client_obj_wait_connect()，反了就永远等不到 ready。
+ *
+ * @return RT_EOK 收到 ready；-RT_ETIMEOUT 重试用完还没应答
+ */
+static rt_err_t combo_power_up_and_wait(void)
+{
+    struct at_device_combo *combo = combo_get_combo();
+    int retry, i;
+
+    /* 没配使能脚就只能等一次：断不了电，重试没意义 */
+    retry = (combo != RT_NULL && combo->power_pin >= 0) ? COMBO_INIT_RETRY_NUM : 1;
+
+    for (i = 0; i < retry; i++)
+    {
+        combo_power_cycle();
+
+        if (at_client_obj_wait_connect(combo_device->client, COMBO_WAIT_CONNECT_TIME) == RT_EOK)
+        {
+            if (i > 0)
+            {
+                LOG_I("module \"ready\" after %d power cycle(s).", i + 1);
+            }
+            return RT_EOK;
+        }
+
+        /* 先断电，下一轮循环开头再上电（不要在这里上电，否则会少掉一个断电间隔） */
+        combo_power_pin_write(0);
+        rt_thread_mdelay(COMBO_POWER_OFF_DELAY_MS);
+
+        LOG_W("wait \"ready\" timeout(%d ms), retry %d/%d",
+              COMBO_WAIT_CONNECT_TIME, i + 1, retry);
+    }
+
+    return -RT_ETIMEOUT;
+}
+
+/** AT 层通用初始化：关回显 + 确认 URC 掩码 + 打印版本 */
+static void combo_at_link_setup(void)
+{
+    char at_ver[32] = {0};
 
     /* 手册 2.6 ATE0：关回显，否则 AT 客户端会把回显行当成数据 */
     combo_at_exec("ATE0");
@@ -723,67 +816,371 @@ static void combo_init_thread_entry(void *parameter)
     {
         LOG_I("combo AT version: %s", at_ver);
     }
+}
 
-    /* 复位/使能脚（没有就不管） */
-    if (combo->power_pin != -1 && combo->power_status_pin != -1)
+/**
+ * 产生唤醒信号：优先用专用唤醒脚，没配就退回"往串口发任意数据"。
+ *
+ * 为什么两种方式都行：手册 2.10 注明 Ai-WB2 的 GPIO 唤醒只能用 IO7，
+ * 而 IO7 就是模组的 RX —— 串口数据的起始位本来就会把 RX 拉低，所以
+ * "IO7 低电平唤醒"和"串口发数据唤醒"在电气上是同一件事，
+ * 区别只是由谁去拉低：
+ *   有专用脚 -> 直接拉 GPIO，时序可控，不往串口塞多余字节
+ *   没专用脚 -> 串口发 2 字节，借用起始位
+ */
+static void combo_wakeup_signal(struct at_client *client)
+{
+    struct at_device_combo *combo = combo_get_combo();
+
+    if (combo != RT_NULL && combo->wakeup_pin >= 0)
     {
-        rt_pin_mode(combo->power_pin, PIN_MODE_OUTPUT);
-        rt_pin_mode(combo->power_status_pin, PIN_MODE_INPUT);
+        rt_pin_mode(combo->wakeup_pin, PIN_MODE_OUTPUT);
+        rt_pin_write(combo->wakeup_pin, COMBO_WAKEUP_PIN_LEVEL);
+        rt_thread_mdelay(COMBO_WAKEUP_PIN_PULSE_MS);
+        rt_pin_write(combo->wakeup_pin, COMBO_PIN_INACTIVE(COMBO_WAKEUP_PIN_LEVEL));
+
+        LOG_I("wakeup: drive pin %d to %d for %d ms.",
+              combo->wakeup_pin, COMBO_WAKEUP_PIN_LEVEL, COMBO_WAKEUP_PIN_PULSE_MS);
+    }
+    else
+    {
+        rt_mutex_t lock = combo_get_lock();
+
+        /* 手册 2.10 备注：向串口发送任意数据唤醒模组 */
+        if (lock != RT_NULL)
+        {
+            rt_mutex_take(lock, RT_WAITING_FOREVER);
+        }
+        at_client_obj_send(client, "\r\n", 2);
+        if (lock != RT_NULL)
+        {
+            rt_mutex_release(lock);
+        }
+
+        LOG_I("wakeup: send uart data (start bit pulls IO7/RX low).");
+    }
+}
+
+int combo_power_on(void)
+{
+    struct at_device_combo *combo = combo_get_combo();
+
+    if (combo_device == RT_NULL || combo == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+    if (combo->power_pin < 0)
+    {
+        LOG_W("no enable pin(COMBO_SAMPLE_POWER_PIN=%d), cannot power on in software.",
+              combo->power_pin);
+        return -RT_ENOSYS;
     }
 
-    /* 手册 4.1.1：AT+WMODE=1,1 -> STA 模式并保存到 flash */
-    if (combo_wifi_set_mode(1, 1) != RT_EOK)
+    /* 直接复用完整初始化流程：上电 -> 等 ready -> ATE0/SYSMSG -> 连 AP -> BLE 设置 */
+    combo_device->is_init = RT_FALSE;
+    return combo_net_init(combo_device);
+}
+
+int combo_power_off(void)
+{
+    struct at_device_combo *combo = combo_get_combo();
+
+    if (combo_device == RT_NULL || combo == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+    if (combo->power_pin < 0)
+    {
+        LOG_W("no enable pin(COMBO_SAMPLE_POWER_PIN=%d), cannot power off in software.",
+              combo->power_pin);
+        return -RT_ENOSYS;
+    }
+
+    combo_power_pin_write(0);
+    rt_thread_mdelay(COMBO_POWER_OFF_DELAY_MS);
+
+    combo_link_up = RT_FALSE;
+    if (combo_device->netdev != RT_NULL)
+    {
+        netdev_low_level_set_link_status(combo_device->netdev, RT_FALSE);
+        netdev_low_level_set_status(combo_device->netdev, RT_FALSE);
+    }
+    combo_device->is_init = RT_FALSE;
+
+    LOG_I("combo module powered off.");
+    return RT_EOK;
+}
+
+int combo_sleep(int mode, int wake_source, int param1, int param2)
+{
+    int ret;
+
+    if (combo_at_get_client() == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+    if (mode < 0 || mode > 3)
+    {
+        return -RT_EINVAL;
+    }
+
+    if (mode == 3)
+    {
+        /* 普通模式：不带唤醒源参数 */
+        ret = combo_at_exec("AT+SLEEP=3");
+    }
+    else if (wake_source == 2)
+    {
+        /* GPIO 唤醒：要引脚序号 + 唤醒电平 */
+        ret = combo_at_exec("AT+SLEEP=%d,2,%d,%d", mode, param1, param2);
+    }
+    else
+    {
+        /* 定时器唤醒：只带定时 ms */
+        ret = combo_at_exec("AT+SLEEP=%d,%d,%d", mode, wake_source, param1);
+    }
+
+    if (ret != RT_EOK)
+    {
+        return ret;
+    }
+
+    /* 回 OK 只表示"已受理"，再等一下让模组真的睡下去（睡下去后串口就不通了） */
+    rt_thread_mdelay(COMBO_SLEEP_ENTER_DELAY_MS);
+
+    combo_link_up = RT_FALSE;
+    if (combo_device != RT_NULL && combo_device->netdev != RT_NULL)
+    {
+        netdev_low_level_set_link_status(combo_device->netdev, RT_FALSE);
+    }
+
+    LOG_I("combo enter sleep: mode=%d source=%d p1=%d p2=%d", mode, wake_source, param1, param2);
+    return RT_EOK;
+}
+
+int combo_wakeup(void)
+{
+    struct at_client *client = combo_at_get_client();
+    int i;
+
+    if (client == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+
+    combo_wakeup_signal(client);
+
+    rt_thread_mdelay(COMBO_WAKEUP_DELAY_MS);
+
+    /* 情况 A：浅睡眠被唤醒 —— 模组没有重启，AT 直接就该应答 */
+    for (i = 0; i < 3; i++)
+    {
+        if (combo_at_exec("AT") == RT_EOK)
+        {
+            combo_at_link_setup();
+            LOG_I("combo woke up (light sleep, no reboot).");
+            return RT_EOK;
+        }
+        rt_thread_mdelay(300);
+    }
+
+    /* 情况 B：深度睡眠被唤醒 —— 模组会重启并重新打印启动信息，等 ready */
+    if (at_client_obj_wait_connect(client, COMBO_WAIT_CONNECT_TIME) != RT_EOK)
+    {
+        LOG_E("wakeup failed: module still no response.");
+        return -RT_ETIMEOUT;
+    }
+
+    combo_at_link_setup();
+    if (combo_device != RT_NULL)
+    {
+        combo_device->is_init = RT_TRUE;
+    }
+
+    LOG_I("combo woke up (deep sleep, module rebooted).");
+    return RT_EOK;
+}
+
+/* ==========================================================================
+ * 网络事件（URC -> 线程）
+ * --------------------------------------------------------------------------
+ * 为什么要有这么个线程：
+ *   URC 回调是由 at_client.c 的 client_parser() 在 **AT 客户端接收线程**里
+ *   原地调用的，而 at_obj_exec_cmd() 要等一个由该线程（走完响应解析后）才会
+ *   rt_event_send 的通知 —— 在 URC 里发 AT 指令必然超时，而且会把接收线程
+ *   堵住好几秒。所以 URC 只 rt_event_send，AT 查询全部交给本线程。
+ * ========================================================================== */
+
+/** 轮询 AT+STAINFO? 直到拿到 IP，然后回填 netdev。拿不到就超时返回 */
+static rt_err_t combo_wifi_wait_and_update(int max_try, int interval_ms)
+{
+    struct combo_wifi_info info;
+    int i;
+
+    rt_memset(&info, 0, sizeof(info));
+
+    if (combo_device == RT_NULL || combo_device->netdev == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+
+    for (i = 0; i < max_try; i++)
+    {
+        /* status==3 表示"已连上且拿到 IP" */
+        if (combo_read_stainfo(&info) == RT_EOK && info.status == 3 && info.ip[0] != '\0')
+        {
+            LOG_I("wifi up: ssid=%s ch=%d ip=%s gw=%s",
+                  info.ssid, info.channel, info.ip, info.gateway);
+            combo_netdev_update(combo_device->netdev, &info);
+            combo_netdev_update_dns(combo_device->netdev);
+            return RT_EOK;
+        }
+        rt_thread_mdelay(interval_ms);
+    }
+
+    LOG_W("wifi got-IP poll timeout (%d tries): status=%d ip=\"%s\"",
+          max_try, info.status, info.ip);
+    return -RT_ETIMEOUT;
+}
+
+static void combo_evt_thread_entry(void *parameter)
+{
+    rt_uint32_t evt;
+
+    RT_UNUSED(parameter);
+
+    while (1)
+    {
+        if (rt_event_recv(&combo_evt, 0xFFFFFFFFu,
+                          RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
+                          RT_WAITING_FOREVER, &evt) != RT_EOK)
+        {
+            continue;
+        }
+
+        if (evt & COMBO_EVT_WIFI_GOT_IP)
+        {
+            /* 刚拿到 IP 的那一瞬 AT+STAINFO? 可能还没更新完，给几次机会 */
+            combo_wifi_wait_and_update(5, 200);
+        }
+    }
+}
+
+/** 建事件 + 起监视线程（只做一次） */
+static void combo_net_evt_init(void)
+{
+    if (combo_evt_ready)
+    {
+        return;
+    }
+
+    rt_event_init(&combo_evt, "combo_evt", RT_IPC_FLAG_FIFO);
+
+    combo_evt_tid = rt_thread_create("combo_netmon", combo_evt_thread_entry, RT_NULL,
+                                     COMBO_EVT_THREAD_STACK_SIZE,
+                                     COMBO_EVT_THREAD_PRIORITY, 20);
+    if (combo_evt_tid == RT_NULL)
+    {
+        LOG_E("create combo net monitor thread failed, WIFI_GOT_IP will not update netdev.");
+        return;
+    }
+
+    rt_thread_startup(combo_evt_tid);
+    combo_evt_ready = RT_TRUE;
+}
+
+#if COMBO_INIT_WIFI_AUTO
+/**
+ * 初始化阶段自动连 WiFi（只有 COMBO_INIT_WIFI_AUTO=1 时才编译进来）。
+ * 默认是关的：init 不碰 WiFi，用的时候调 combo_wifi_start()。
+ */
+static void combo_wifi_auto_connect(struct at_device *device)
+{
+    struct at_device_combo *combo = (struct at_device_combo *)device->user_data;
+    int i;
+
+    if (combo->wifi_ssid == RT_NULL || combo->wifi_ssid[0] == '\0')
+    {
+        LOG_I("no wifi ssid configured, skip join (call combo_wifi_start later).");
+        return;
+    }
+
+    /* 手册 4.1.1：AT+WMODE=1,<save> -> STA 模式 */
+    if (combo_wifi_set_mode(1, COMBO_WIFI_MODE_SAVE) != RT_EOK)
     {
         LOG_W("set STA mode failed.");
     }
 
-    if (combo->wifi_ssid != RT_NULL && combo->wifi_ssid[0] != '\0')
+    for (i = 0; i < 3; i++)
     {
-        for (i = 0; i < 3; i++)
+        if (combo_wifi_join(combo->wifi_ssid, combo->wifi_password) == RT_EOK)
         {
-            if (combo_wifi_join(combo->wifi_ssid, combo->wifi_password) == RT_EOK)
-            {
-                break;
-            }
-            LOG_W("join \"%s\" failed, retry %d/3", combo->wifi_ssid, i + 1);
-            rt_thread_mdelay(2000);
+            break;
         }
-
-        /* 等 DHCP：轮询 AT+STAINFO?，status==3 表示已连上且拿到 IP */
-        for (i = 0; i < 30; i++)
-        {
-            if (combo_read_stainfo(&info) == RT_EOK && info.status == 3)
-            {
-                break;
-            }
-            rt_thread_mdelay(500);
-        }
-
-        if (i >= 30)
-        {
-            LOG_E("wifi got IP timeout (last status=%d, ip=\"%s\")", info.status, info.ip);
-        }
-        else
-        {
-            LOG_I("wifi up: ssid=%s ch=%d ip=%s gw=%s", info.ssid, info.channel, info.ip, info.gateway);
-            combo_netdev_update(device->netdev, &info);
-            combo_netdev_update_dns(device->netdev);
-        }
-    }
-    else
-    {
-        LOG_I("no wifi ssid configured, skip join (call combo_wifi_join later).");
+        LOG_W("join \"%s\" failed, retry %d/3", combo->wifi_ssid, i + 1);
+        rt_thread_mdelay(2000);
     }
 
-    /* BLE：手册 5.1.2，连接后自动进透传会让 AT 指令失效，这里要求不自动进透传 */
-    if (combo_ble_trans_enter_config(0, 1) != RT_EOK)
+    /* 等 DHCP 拿 IP 并回填 netdev（最多 30*500ms） */
+    combo_wifi_wait_and_update(30, 500);
+}
+#endif /* COMBO_INIT_WIFI_AUTO */
+
+/* ==========================================================================
+ * 初始化线程
+ * ========================================================================== */
+static void combo_init_thread_entry(void *parameter)
+{
+    struct at_device *device = (struct at_device *)parameter;
+    struct at_device_combo *combo = (struct at_device_combo *)device->user_data;
+
+    /* 使能脚先就位（手册 1.3：芯片使能管脚，高电平有效）。
+     * power_pin 与 power_status_pin 各自独立判断 —— 只接使能脚、不接状态脚
+     * 是完全正常的用法，不能因为 status_pin 是 -1 就把使能也一起跳过。 */
+    if (combo->power_pin >= 0)
     {
-        LOG_D("set BLE auto-transparent off failed (old firmware?).");
+        rt_pin_mode(combo->power_pin, PIN_MODE_OUTPUT);
     }
-    if (combo_ble_set_name(COMBO_SAMPLE_BLE_NAME) != RT_EOK)
+    if (combo->power_status_pin >= 0)
     {
-        LOG_D("set BLE name \"%s\" failed.", COMBO_SAMPLE_BLE_NAME);
+        rt_pin_mode(combo->power_status_pin, PIN_MODE_INPUT);
     }
+
+    /* 唤醒脚：有就配成输出，并先置成"无效"电平，
+     * 别在上电阶段就把模组按在唤醒态（而深度睡眠时又恰恰需要它拉低） */
+    if (combo->wakeup_pin >= 0)
+    {
+        rt_pin_mode(combo->wakeup_pin, PIN_MODE_OUTPUT);
+        rt_pin_write(combo->wakeup_pin, COMBO_PIN_INACTIVE(COMBO_WAKEUP_PIN_LEVEL));
+    }
+
+    /* 先上电（必要时断电重来），再等启动信息（手册 1.2，最后一行是 ready）。
+     * 顺序不能反：模组没使能的话永远等不到 ready。 */
+    if (combo_power_up_and_wait() != RT_EOK)
+    {
+        LOG_E("combo module no response(%d ms), check uart wiring/baudrate(115200 8N1) "
+              "and the enable pin.", COMBO_WAIT_CONNECT_TIME);
+        return;
+    }
+
+    /* ATE0 + URC 掩码 + 打印版本 */
+    combo_at_link_setup();
+
+    /* ---- 可选的 WiFi 自动连接（默认关，见 COMBO_INIT_WIFI_AUTO）---- */
+#if COMBO_INIT_WIFI_AUTO
+    combo_wifi_auto_connect(device);
+#else
+    LOG_I("wifi auto-connect off (COMBO_INIT_WIFI_AUTO=0), "
+          "call combo_wifi_start(ssid, pwd) when needed.");
+#endif
+
+    /* ---- 可选的 BLE 配置（默认关，见 COMBO_INIT_BLE_SETUP）---- */
+#if COMBO_INIT_BLE_SETUP
+    combo_ble_start(COMBO_SAMPLE_BLE_NAME, COMBO_BLE_MODE);
+#else
+    LOG_I("BLE setup off (COMBO_INIT_BLE_SETUP=0), "
+          "call combo_ble_start(name, mode) when needed.");
+#endif
 
     device->is_init = RT_TRUE;
     LOG_I("combo device(%s) init done.", device->name);
@@ -827,23 +1224,20 @@ static void urc_ready_func(struct at_client *client, const char *data, rt_size_t
 
 static void urc_wifi_got_ip_func(struct at_client *client, const char *data, rt_size_t size)
 {
-    struct combo_wifi_info info;
-
     RT_UNUSED(client);
     RT_UNUSED(data);
     RT_UNUSED(size);
 
     LOG_I("URC: WIFI_GOT_IP");
 
-    if (combo_device == RT_NULL || combo_device->netdev == RT_NULL)
+    /* !!! 这里绝对不能发 AT 指令 !!!
+     * 本回调由 client_parser() 在 AT 客户端接收线程里原地调用，在里面
+     * at_obj_exec_cmd() 会等一个只有该线程才能发出的响应通知 -> 必然超时，
+     * 而且会把接收线程堵住 resp->timeout 那么久。
+     * 所以只置事件，AT+STAINFO? 查询交给 combo_evt_thread_entry()。 */
+    if (combo_evt_ready)
     {
-        return;
-    }
-
-    if (combo_read_stainfo(&info) == RT_EOK)
-    {
-        combo_netdev_update(combo_device->netdev, &info);
-        combo_netdev_update_dns(combo_device->netdev);
+        rt_event_send(&combo_evt, COMBO_EVT_WIFI_GOT_IP);
     }
 }
 
@@ -1007,6 +1401,9 @@ static int combo_init(struct at_device *device)
     combo_client = device->client;
     combo_link_up = RT_FALSE;
 
+    /* 先把"网络事件"通路建好，URC 随时可能来 */
+    combo_net_evt_init();
+
     at_obj_set_urc_table(device->client, urc_table, sizeof(urc_table) / sizeof(urc_table[0]));
 
 #ifdef AT_USING_SOCKET
@@ -1129,10 +1526,26 @@ static int combo_control(struct at_device *device, int cmd, void *arg)
         break;
 
     case AT_DEVICE_CTRL_POWER_ON:
+        result = combo_power_on();
+        break;
+
     case AT_DEVICE_CTRL_POWER_OFF:
+        result = combo_power_off();
+        break;
+
     case AT_DEVICE_CTRL_LOW_POWER:
     case AT_DEVICE_CTRL_SLEEP:
+        /* 手册 2.10：Ai-WB2 只有 mode 2(深度睡眠)/3(普通)，浅睡眠 0/1 是
+         * PB/TB 系列才支持。两个命令都按 COMBO_SLEEP_* 走；要浅睡眠就改宏
+         * 或直接调 combo_sleep(0/1, 2, 7, 0)。 */
+        result = combo_sleep(COMBO_SLEEP_MODE, COMBO_SLEEP_WAKE_SOURCE,
+                             COMBO_SLEEP_WAKE_PIN, COMBO_SLEEP_WAKE_LEVEL);
+        break;
+
     case AT_DEVICE_CTRL_WAKEUP:
+        result = combo_wakeup();
+        break;
+
     case AT_DEVICE_CTRL_GET_GPS:
     case AT_DEVICE_CTRL_SET_HOST_NAME:
         LOG_W("not support the control cmd(%d).", cmd);
@@ -1191,6 +1604,7 @@ void combo_at_dev_init(struct at_device_combo *combo,
     combo->client_name      = (char *)((client_name != RT_NULL) ? client_name : COMBO_SAMPLE_CLIENT_NAME);
     combo->power_pin        = COMBO_SAMPLE_POWER_PIN;
     combo->power_status_pin = COMBO_SAMPLE_STATUS_PIN;
+    combo->wakeup_pin       = COMBO_SAMPLE_WAKEUP_PIN;
     combo->recv_line_num    = COMBO_SAMPLE_RECV_BUFF_LEN;
     combo->wifi_ssid        = (char *)((ssid != RT_NULL) ? ssid : COMBO_SAMPLE_WIFI_SSID);
     combo->wifi_password    = (char *)((password != RT_NULL) ? password : COMBO_SAMPLE_WIFI_PASSWORD);
@@ -1217,6 +1631,25 @@ int combo_at_dev_register(struct at_device_combo *combo)
 /* ==========================================================================
  * WiFi API
  * ========================================================================== */
+int combo_wifi_start(const char *ssid, const char *password)
+{
+    if (ssid == RT_NULL || ssid[0] == '\0')
+    {
+        return -RT_EINVAL;
+    }
+
+    /* 手册 4.1.1：先切到 STA 模式（默认不写 flash，见 COMBO_WIFI_MODE_SAVE） */
+    if (combo_wifi_set_mode(1, COMBO_WIFI_MODE_SAVE) != RT_EOK)
+    {
+        LOG_W("set STA mode failed, try AT+WJAP anyway.");
+    }
+
+    /* 手册 4.1.6：AT+WJAP=<ssid>,<pwd>
+     * 连上并拿到 IP 后模组会发 +EVENT:WIFI_GOT_IP，由监视线程拉起 netdev，
+     * 所以这里不用轮询等 IP。 */
+    return combo_wifi_join(ssid, password);
+}
+
 int combo_wifi_set_mode(int mode, int save_flash)
 {
     if (mode < 0 || mode > 3)
@@ -1463,6 +1896,34 @@ static void combo_ble_exit_setting(int saved_mode)
     }
 }
 
+int combo_ble_start(const char *name, int mode)
+{
+    int result = RT_EOK;
+
+    /* 手册 5.1.12：BLE 连接后自动进透传会让 AT 指令失效 -> 关掉
+     * （默认不写 flash，见 COMBO_BLE_CFG_SAVE） */
+    if (combo_ble_trans_enter_config(0, COMBO_BLE_CFG_SAVE) != RT_EOK)
+    {
+        LOG_D("set BLE auto-transparent off failed (old firmware?).");
+    }
+
+    /* 手册 5.1.1：改名字要求蓝牙关闭，combo_ble_set_name() 内部会自动处理 */
+    if (name != RT_NULL && name[0] != '\0' && combo_ble_set_name(name) != RT_EOK)
+    {
+        LOG_W("set BLE name \"%s\" failed.", name);
+        result = -RT_ERROR;
+    }
+
+    /* 手册 5.1.2：模式 0 从机 1 主机 2 iBeacon 9 关闭；mode<0 表示不动 */
+    if (mode >= 0 && combo_ble_set_mode(mode) != RT_EOK)
+    {
+        LOG_W("set BLE mode %d failed.", mode);
+        result = -RT_ERROR;
+    }
+
+    return result;
+}
+
 int combo_ble_set_mode(int mode)
 {
     if (mode != 0 && mode != 1 && mode != 2 && mode != 9)
@@ -1665,6 +2126,85 @@ int combo_ble_set_adv_interval(int intv)
     result = combo_at_exec("AT+BLEADVINTV=%d", intv);
     combo_ble_exit_setting(saved);
 
+    return result;
+}
+
+int combo_ble_set_conn_interval(int min_interval, int max_interval, int latency, int timeout)
+{
+    int saved, result;
+
+    /* 手册 5.2.3 的参数范围 */
+    if (min_interval < 6 || min_interval > 3200 ||
+        max_interval < 6 || max_interval > 3200 ||
+        latency < 0 || latency > 499 ||
+        timeout < 10 || timeout > 3200)
+    {
+        LOG_E("invalid conn interval: min=%d max=%d latency=%d timeout=%d",
+              min_interval, max_interval, latency, timeout);
+        return -RT_EINVAL;
+    }
+    if (min_interval > max_interval)
+    {
+        LOG_E("min_interval(%d) must not exceed max_interval(%d).", min_interval, max_interval);
+        return -RT_EINVAL;
+    }
+
+    /* 手册的规范约束： Timeout*10 > (1+Latency)*max_interval*1.25   （单位都是 ms）
+     * 两边同乘 4 换算成整数，避免用浮点：
+     *     timeout*40 > (1+latency)*max_interval*5
+     * 不满足的话模组会回参数错误，这里先拦下来，免得白跑一趟 AT。 */
+    if ((1 + latency) * max_interval * 5 >= timeout * 40)
+    {
+        long need_ms = ((long)(1 + latency) * max_interval * 125) / 100;
+
+        LOG_E("timeout(%dms) too small: must be > (1+latency)*max_interval*1.25 = %ldms.",
+              timeout * 10, need_ms);
+        return -RT_EINVAL;
+    }
+
+    /* 手册 5.2.3：仅允许在蓝牙关闭状态下设置 */
+    if (combo_ble_enter_setting(&saved) != RT_EOK)
+    {
+        return -RT_ERROR;
+    }
+    result = combo_at_exec("AT+BLECONINTV=%d,%d,%d,%d",
+                           min_interval, max_interval, latency, timeout);
+    combo_ble_exit_setting(saved);
+
+    return result;
+}
+
+int combo_ble_get_conn_interval(int *min_interval, int *max_interval, int *latency, int *timeout)
+{
+    at_response_t resp = RT_NULL;
+    int mn = 0, mx = 0, lat = 0, tmo = 0;
+    int result = -RT_ERROR;
+
+    if (combo_at_get_client() == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+
+    resp = at_create_resp(128, 0, COMBO_RESP_TIMEOUT);
+    if (resp == RT_NULL)
+    {
+        return -RT_ENOMEM;
+    }
+
+    /* 手册 5.2.3 响应 "+BLECONINTV:<min>,< max>,<latency>,< timeout>"（逗号后有空格，%d 会自己跳过） */
+    if (at_obj_exec_cmd(combo_at_get_client(), resp, "AT+BLECONINTV?") == RT_EOK &&
+        at_resp_parse_line_args_by_kw(resp, "+BLECONINTV",
+                                      "+BLECONINTV:%d,%d,%d,%d",
+                                      &mn, &mx, &lat, &tmo) > 0)
+    {
+        if (min_interval != RT_NULL) *min_interval = mn;
+        if (max_interval != RT_NULL) *max_interval = mx;
+        if (latency != RT_NULL) *latency = lat;
+        if (timeout != RT_NULL) *timeout = tmo;
+        result = RT_EOK;
+    }
+
+    at_delete_resp(resp);
     return result;
 }
 
@@ -1943,6 +2483,57 @@ static void combo_scan(int argc, char **argv)
 }
 MSH_CMD_EXPORT_ALIAS(combo_scan, combo_scan, combo module: scan AP list);
 
+static void combo_power_msh(int argc, char **argv)
+{
+    if (argc < 2)
+    {
+        rt_kprintf("usage: combo_power on|off   (needs COMBO_SAMPLE_POWER_PIN >= 0)\n");
+        return;
+    }
+
+    if (rt_strcmp(argv[1], "on") == 0)
+    {
+        rt_kprintf("power on : %s\n", (combo_power_on() == RT_EOK) ? "OK" : "FAIL");
+    }
+    else if (rt_strcmp(argv[1], "off") == 0)
+    {
+        rt_kprintf("power off: %s\n", (combo_power_off() == RT_EOK) ? "OK" : "FAIL");
+    }
+    else
+    {
+        rt_kprintf("unknown subcmd \"%s\"\n", argv[1]);
+    }
+}
+MSH_CMD_EXPORT_ALIAS(combo_power_msh, combo_power, combo module: enable pin on/off);
+
+static void combo_sleep_msh(int argc, char **argv)
+{
+    int mode = COMBO_SLEEP_MODE;
+    int src  = COMBO_SLEEP_WAKE_SOURCE;
+    int p1   = COMBO_SLEEP_WAKE_PIN;
+    int p2   = COMBO_SLEEP_WAKE_LEVEL;
+
+    if (argc >= 2) mode = atoi(argv[1]);
+    if (argc >= 3) src  = atoi(argv[2]);
+    if (argc >= 4) p1   = atoi(argv[3]);
+    if (argc >= 5) p2   = atoi(argv[4]);
+
+    rt_kprintf("AT+SLEEP=%d,%d,%d,%d -> %s\n", mode, src, p1, p2,
+               (combo_sleep(mode, src, p1, p2) == RT_EOK) ? "OK" : "ERROR");
+    rt_kprintf("note: Ai-WB2 only supports mode 2/3; wake by sending anything on uart,\n"
+               "      because IO7(=RX) low level is the only GPIO wake source.\n");
+}
+MSH_CMD_EXPORT_ALIAS(combo_sleep_msh, combo_sleep, combo module: sleep (mode,src,p1,p2));
+
+static void combo_wakeup_msh(int argc, char **argv)
+{
+    RT_UNUSED(argc);
+    RT_UNUSED(argv);
+
+    rt_kprintf("wakeup: %s\n", (combo_wakeup() == RT_EOK) ? "OK" : "FAIL");
+}
+MSH_CMD_EXPORT_ALIAS(combo_wakeup_msh, combo_wakeup, combo module: wake up from sleep);
+
 static void combo_ping_msh(int argc, char **argv)
 {
     int avg = -1;
@@ -1976,6 +2567,7 @@ static void combo_ble_msh(int argc, char **argv)
                    "  combo_ble name [str]       device name (no arg = query)\n"
                    "  combo_ble mac              ble mac\n"
                    "  combo_ble adv [0|1]        adv enable (no arg = query)\n"
+                   "  combo_ble connintv [min max latency timeout]  conn interval (×1.25ms / ×10ms)\n"
                    "  combo_ble state            connect state\n"
                    "  combo_ble discon           disconnect\n"
                    "  combo_ble scan             scan (master mode)\n"
@@ -2024,6 +2616,31 @@ static void combo_ble_msh(int argc, char **argv)
         else if (combo_ble_get_adv_enable(&value) == RT_EOK)
         {
             rt_kprintf("adv enable = %d\n", value);
+        }
+    }
+    else if (rt_strcmp(argv[1], "connintv") == 0)
+    {
+        if (argc >= 6)
+        {
+            rt_kprintf("set conn interval(min,max,latency,timeout)=%s,%s,%s,%s: %s\n",
+                       argv[2], argv[3], argv[4], argv[5],
+                       (combo_ble_set_conn_interval(atoi(argv[2]), atoi(argv[3]),
+                                                    atoi(argv[4]), atoi(argv[5])) == RT_EOK)
+                       ? "OK" : "FAIL");
+        }
+        else
+        {
+            int mn = 0, mx = 0, lat = 0, tmo = 0;
+
+            if (combo_ble_get_conn_interval(&mn, &mx, &lat, &tmo) == RT_EOK)
+            {
+                rt_kprintf("conn interval: min=%d max=%d latency=%d timeout=%d\n",
+                           mn, mx, lat, tmo);
+            }
+            else
+            {
+                rt_kprintf("query conn interval failed\n");
+            }
         }
     }
     else if (rt_strcmp(argv[1], "state") == 0)
@@ -2080,30 +2697,4 @@ static void combo_at_msh(int argc, char **argv)
 MSH_CMD_EXPORT_ALIAS(combo_at_msh, combo_at, combo module: send raw AT command);
 
 #endif /* FINSH_USING_MSH */
-
-/* ==========================================================================
- * 照 at_sample_a9g.c 的用法：静态实例 + 开机自动注册
- * 不需要自动注册就定义 COMBO_AT_DEV_AUTO_REGISTER_DISABLE
- * ========================================================================== */
-#if 0 /* 静态实例 + 自动注册已挪到 examples/at_sample_combo.c（按 at_device 包的惯例：
-       * 驱动只注册 device class，设备实例由 sample 注册），避免同一个 uart 上注册两次。
-       * 不想用示例、要在这里注册的话，把下面这行改回 #ifndef COMBO_AT_DEV_AUTO_REGISTER_DISABLE */
-static struct at_device_combo combo0 =
-{
-    .device_name      = COMBO_SAMPLE_DEVICE_NAME,
-    .client_name      = COMBO_SAMPLE_CLIENT_NAME,
-    .power_pin        = COMBO_SAMPLE_POWER_PIN,
-    .power_status_pin = COMBO_SAMPLE_STATUS_PIN,
-    .recv_line_num    = COMBO_SAMPLE_RECV_BUFF_LEN,
-    .wifi_ssid        = COMBO_SAMPLE_WIFI_SSID,
-    .wifi_password    = COMBO_SAMPLE_WIFI_PASSWORD,
-};
-
-static int combo_at_dev_auto_register(void)
-{
-    return combo_at_dev_register(&combo0);
-}
-INIT_APP_EXPORT(combo_at_dev_auto_register);
-#endif /* COMBO_AT_DEV_AUTO_REGISTER_DISABLE */
-
 #endif /* AT_DEVICE_USING_COMBO */
